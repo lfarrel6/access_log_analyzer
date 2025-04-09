@@ -80,7 +80,7 @@ impl LogFileBatchAnalyzer {
                             };
                         }
                         let labelled_log = AccessLog::from(tokens);
-                        if labelled_log.target_status_code.is_none() {
+                        if labelled_log.elb_status_code.as_ref() == "460" || labelled_log.elb_status_code.as_ref() == "502" {
                             let _ = self.channel.send(labelled_log);
                         }
                         access_log_line.clear();
