@@ -153,53 +153,96 @@ fn match_columnar_value(val: &str) -> IResult<&str, &str> {
 
 fn main() {
     let contents = read_dir("./assets").unwrap();
-    let mut parsed_logs = vec![];
-
-    contents.for_each(|file| {
-        let Ok(file) = file else {
-            todo!("Handle error in dir entries");
-        };
-        let Ok(Ok(cwd)) = std::env::current_dir().map(|cwd| cwd.into_os_string().into_string())
-        else {
-            todo!("No CWD available");
-        };
-        let Ok(file_name) = file.file_name().into_string() else {
-            todo!("Unserializable file name");
-        };
-        let with_dir = format!("{cwd}/assets/{file_name}");
-        let file_handle = OpenOptions::new().read(true).open(&with_dir);
-
-        let Ok(file_handle) = file_handle else {
-            todo!("Invalid file handle");
-        };
-        let mut buf_reader = BufReader::new(file_handle);
-        let mut access_log_line = String::with_capacity(600_usize);
-        loop {
-            match buf_reader.read_line(&mut access_log_line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let mut parse_target = access_log_line.as_str();
-                    let mut tokens: [&str; 30] = [std::default::Default::default(); 30];
-                    let mut cnt: usize = 0;
-                    loop {
-                        match match_columnar_value(parse_target) {
-                            Ok((x, y)) => {
-                                tokens[cnt] = y;
-                                cnt += 1;
-                                parse_target = x;
-                            }
-                            Err(_) => break,
-                        };
-                    }
-                    parsed_logs.push(AccessLog::from(tokens));
-                    access_log_line.clear();
-                }
-                Err(_) => todo!("Handle bad file read"),
-            };
-        }
-    });
-    let Ok(parsed_logs) = serde_json::to_string(&parsed_logs) else {
-        todo!("Handle invalid log")
+    let Ok(available_parallelism) = std::thread::available_parallelism() else {
+        todo!("Handle failure reading available parallelism");
     };
-    println!("{parsed_logs}");
+
+    let (log_of_interest_sender, log_of_interest_receiver) =
+        std::sync::mpsc::channel::<AccessLog>();
+
+    let mut log_files = contents
+        .filter_map(|file| {
+            let Ok(file) = file else {
+                todo!("Handle error in dir entries");
+            };
+            let Ok(Ok(cwd)) = std::env::current_dir().map(|cwd| cwd.into_os_string().into_string())
+            else {
+                todo!("No CWD available");
+            };
+            let Ok(file_name) = file.file_name().into_string() else {
+                todo!("Unserializable file name");
+            };
+
+            // ignore non log files
+            if !file_name.ends_with(".log") {
+                return None;
+            }
+            let with_dir = format!("{cwd}/assets/{file_name}");
+            Some(with_dir)
+        })
+        .collect::<Vec<String>>();
+
+    let n_files_per_thread = log_files.len() / available_parallelism;
+    
+    for thread_idx in 0..available_parallelism.into() {
+        let files = log_files
+            .drain(log_files.len() - n_files_per_thread..)
+            .collect::<Vec<String>>();
+        let log_sender = log_of_interest_sender.clone();
+        std::thread::spawn(move || {
+            for file_path in files {
+                let file_handle = OpenOptions::new().read(true).open(&file_path);
+
+                let Ok(file_handle) = file_handle else {
+                    todo!("Invalid file handle");
+                };
+                let mut buf_reader = BufReader::new(file_handle);
+                let mut access_log_line = String::with_capacity(600_usize);
+                eprintln!("Processing {file_path}");
+                loop {
+                    match buf_reader.read_line(&mut access_log_line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let mut parse_target = access_log_line.as_str();
+                            let mut tokens: [&str; 30] = [std::default::Default::default(); 30];
+                            let mut cnt: usize = 0;
+                            loop {
+                                match match_columnar_value(parse_target) {
+                                    _ if cnt >= tokens.len() => {
+                                        eprintln!(
+                                            "Encountered more fields than expected in log file, ignoring."
+                                        );
+                                        break;
+                                    }
+                                    Ok((x, y)) => {
+                                        tokens[cnt] = y;
+                                        cnt += 1;
+                                        parse_target = x;
+                                    }
+                                    Err(_) => break,
+                                };
+                            }
+                            let labelled_log = AccessLog::from(tokens);
+                            if labelled_log.target_status_code.is_none() {
+                              let _ = log_sender.send(labelled_log);
+                            }
+                            access_log_line.clear();
+                        }
+                        Err(_) => todo!("Handle bad file read"),
+                    };
+                }
+            }
+            eprintln!("THREAD COMPLETE: {}/{}", thread_idx, available_parallelism);
+        });
+    }
+    drop(log_of_interest_sender);
+
+    let mut logs_of_interest = Vec::with_capacity(50);
+    while let Ok(unhealthy_log) = log_of_interest_receiver.recv() {
+      logs_of_interest.push(unhealthy_log);
+    }
+
+    if let Ok(logs) = serde_json::to_string(&logs_of_interest) {
+        println!("{logs}");
+    }
 }
