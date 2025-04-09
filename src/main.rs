@@ -1,12 +1,7 @@
-use nom::{
-    IResult,
-    bytes::complete::{tag, take_until},
-    combinator::{map, opt},
-    sequence::terminated,
-};
 use serde::Serialize;
-use std::fs::{OpenOptions, read_dir};
-use std::io::{BufRead, BufReader};
+use std::fs::read_dir;
+
+mod analyzer;
 
 #[derive(Default, Serialize)]
 struct AccessLog {
@@ -133,24 +128,6 @@ impl std::convert::From<[&str; 30]> for AccessLog {
     }
 }
 
-fn quote(input: &str) -> IResult<&str, &str> {
-    tag("\"")(input)
-}
-
-fn space(input: &str) -> IResult<&str, &str> {
-    tag(" ")(input)
-}
-
-fn match_columnar_value(val: &str) -> IResult<&str, &str> {
-    let (remaining, leading_quote) = map(opt(quote), |leading_quote| leading_quote.is_some())(val)?;
-    if leading_quote {
-        let x = terminated(take_until(r#"""#), tag(r#"" "#))(remaining);
-        return x;
-    }
-    let x = terminated(take_until(r#" "#), space)(remaining);
-    return x;
-}
-
 fn main() {
     let contents = read_dir("./assets").unwrap();
     let Ok(available_parallelism) = std::thread::available_parallelism() else {
@@ -183,56 +160,15 @@ fn main() {
         .collect::<Vec<String>>();
 
     let n_files_per_thread = log_files.len() / available_parallelism;
-    
-    for thread_idx in 0..available_parallelism.into() {
+
+    for _ in 0..available_parallelism.into() {
         let files = log_files
             .drain(log_files.len() - n_files_per_thread..)
             .collect::<Vec<String>>();
         let log_sender = log_of_interest_sender.clone();
+        let batch_analyzer = analyzer::LogFileBatchAnalyzer::from((files, log_sender));
         std::thread::spawn(move || {
-            for file_path in files {
-                let file_handle = OpenOptions::new().read(true).open(&file_path);
-
-                let Ok(file_handle) = file_handle else {
-                    todo!("Invalid file handle");
-                };
-                let mut buf_reader = BufReader::new(file_handle);
-                let mut access_log_line = String::with_capacity(600_usize);
-                eprintln!("Processing {file_path}");
-                loop {
-                    match buf_reader.read_line(&mut access_log_line) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let mut parse_target = access_log_line.as_str();
-                            let mut tokens: [&str; 30] = [std::default::Default::default(); 30];
-                            let mut cnt: usize = 0;
-                            loop {
-                                match match_columnar_value(parse_target) {
-                                    _ if cnt >= tokens.len() => {
-                                        eprintln!(
-                                            "Encountered more fields than expected in log file, ignoring."
-                                        );
-                                        break;
-                                    }
-                                    Ok((x, y)) => {
-                                        tokens[cnt] = y;
-                                        cnt += 1;
-                                        parse_target = x;
-                                    }
-                                    Err(_) => break,
-                                };
-                            }
-                            let labelled_log = AccessLog::from(tokens);
-                            if labelled_log.target_status_code.is_none() {
-                              let _ = log_sender.send(labelled_log);
-                            }
-                            access_log_line.clear();
-                        }
-                        Err(_) => todo!("Handle bad file read"),
-                    };
-                }
-            }
-            eprintln!("THREAD COMPLETE: {}/{}", thread_idx, available_parallelism);
+          batch_analyzer.run();
         });
     }
     drop(log_of_interest_sender);
